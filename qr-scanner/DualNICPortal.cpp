@@ -1,5 +1,12 @@
 #include "DualNICPortal.h"
 
+// ---- MQTT probe state (non-blocking terhadap AsyncWebServer) ----
+static volatile bool s_mqttProbeRequested = false;
+static volatile bool s_mqttProbeRunning   = false;
+static volatile bool s_mqttLastOK         = false;
+static volatile int  s_mqttLastRC         = 0;
+
+
 // ================== HTML UI ==================
 extern const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
 <html lang="id">
@@ -78,7 +85,7 @@ extern const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
   </section>
 
   <section class="card">
-    <h3>MQTT</h3>
+    <h3>Server Configuration</h3>
     <div class="grid">
       <div><label>Host</label><input id="mqHost" placeholder="broker.local"></div>
       <div><label>Port</label><input id="mqPort" type="number" value="1883"></div>
@@ -86,8 +93,7 @@ extern const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
       <div><label>Password</label><input id="mqPass" type="password" placeholder="(opsional)"></div>
       <div><label>Topic</label><input id="mqTopic" placeholder="device/telemetry"></div>
       <div style="align-self:end" class="row">
-        <button id="saveMQTT">Simpan</button>
-        <button id="testMQTT">Tes Konektivitas (30s)</button>
+        <button id="saveMQTT">Simpan & Sambungkan</button>
       </div>
     </div>
   </section>
@@ -113,6 +119,7 @@ extern const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
 <script>
 const $ = sel => document.querySelector(sel);
 const api = (p, opt={}) => fetch(p, Object.assign({headers:{'Content-Type':'application/json'}}, opt));
+const setIfIdle = (el, v) => { if (!el) return; if (document.activeElement === el) return; el.value = v ?? ''; };
 let uiMode = 'wifi';
 function fmtMs(ms){ if(ms<=0) return '—'; const s=Math.ceil(ms/1000); const m=Math.floor(s/60); const r=s%60; return `${m}:${String(r).padStart(2,'0')}`; }
 
@@ -138,11 +145,24 @@ async function refreshStatus(){
     $('#ethGW').value = j.cfg.eth_gateway||'';
     $('#ethSN').value = j.cfg.eth_subnet||'';
 
-    $('#mqHost').value = j.mqtt.host||'';
+    const mqttHost = $('#mqHost');
+    if (mqttHost && mqttHost !== document.activeElement){
+      if (mqttHost.value === '' || mqttHost.value === (j.mqtt.host || '')) mqttHost.value = j.mqtt.host || '';
+    }
     $('#mqPort').value = j.mqtt.port||1883;
-    $('#mqUser').value = j.mqtt.user||'';
-    $('#mqPass').value = j.mqtt.pass||'';
-    $('#mqTopic').value = j.mqtt.topic||'';
+    const mqUser = $('#mqUser');
+    if (mqUser && mqUser !== document.activeElement){
+      if (mqUser.value === '' || mqUser.value === (j.mqtt.user || '')) mqUser.value = j.mqtt.user || '';
+    }
+    const mqPass = $('#mqPass');
+    if (mqPass && mqPass !== document.activeElement){
+      mqPass.value = '';
+      mqPass.placeholder = (j.mqtt?.pass_set ? '(tersimpan)' : '(opsional)');
+    }
+    const mqTopic = $('#mqTopic');
+    if (mqTopic && mqTopic !== document.activeElement){
+      if (mqTopic.value === '' || mqTopic.value === (j.mqtt.topic || '')) mqTopic.value = j.mqtt.topic || '';
+    }
 
     $('#wifiCard').classList.toggle('hide', uiMode !== 'wifi');
     $('#ethCard').classList.toggle('hide', uiMode !== 'ethernet');
@@ -182,15 +202,20 @@ $('#saveEth')?.addEventListener('click', async ()=>{
 });
 
 $('#saveMQTT').addEventListener('click', async ()=>{
-  const host=$('#mqHost').value.trim(), port=Number($('#mqPort').value||1883), user=$('#mqUser').value, pass=$('#mqPass').value, topic=$('#mqTopic').value;
-  const r = await api('/api/mqtt/set',{method:'POST',body:JSON.stringify({host,port,user,pass,topic})});
-  alert(r.ok? 'MQTT disimpan.':'Gagal menyimpan MQTT.');
+  const host=$('#mqHost').value.trim(), port=Number($('#mqPort').value||1883),
+        user=$('#mqUser').value.trim(), pass=$('#mqPass').value.trim(),
+        topic=$('#mqTopic').value.trim();
+  if(!host){ alert("Masukkan Host Server Terlebih dahulu"); return; }
+  const payload = {host, port, user, topic};
+  if (pass) payload.pass = pass; // hanya kirim jika diisi
+  const r = await api('/api/mqtt/set',{method:'POST',body:JSON.stringify(payload)});
+  const j = await r.json();
+  if (!r.ok) { alert('Gagal menyimpan MQTT.'); return; }
+  // Tampilkan status testing, hasil akan muncul via /api/status yang dipoll tiap 2s
+  alert('Disimpan. Mencoba koneksi MQTT…');
+  refreshStatus();
 });
-$('#testMQTT').addEventListener('click', async ()=>{
-  const r = await api('/api/mqtt/test',{method:'POST'});
-  const ok = r.ok; const j = await r.json();
-  alert(ok? 'MQTT OK.':'MQTT gagal/timeout.');
-});
+
 
 // offline queue UI akan memanggil endpoint ekstra yang kamu tambahkan di sketch
 $('#flushQueue')?.addEventListener('click', async ()=>{
@@ -251,7 +276,26 @@ void DualNICPortal::loop(){
 
   // Wi-Fi watchdog
   wifiWatchdogLoop();
+
+  // ---- MQTT probe dijalankan di sini, bukan di handler HTTP ----
+  if (s_mqttProbeRequested && !s_mqttProbeRunning) {
+    s_mqttProbeRunning = true;
+    s_mqttProbeRequested = false;
+
+    // Lakukan tes koneksi dengan timeout singkat supaya loop tidak lama berhenti
+    // Gunakan klien test internal (_mqttTest) yang sudah ada
+    // (opsional) kecilkan socket timeout supaya cepat
+    _mqttTest.setSocketTimeout(2); // detik
+
+    bool ok = mqttTestConnectivity(6000); // ~6s max
+    s_mqttLastRC = _mqttTest.state();
+    s_mqttLastOK = ok;
+    if (ok) _mqttTest.disconnect();
+
+    s_mqttProbeRunning = false;
+  }
 }
+
 
 bool DualNICPortal::selectClient(PubSubClient& mqtt, WiFiClient& wifiClientRef, EthernetClient& ethClientRef){
   if (WiFi.status() == WL_CONNECTED) { mqtt.setClient(wifiClientRef); return true; }
@@ -521,7 +565,7 @@ void DualNICPortal::serveEthernet(){
 
 void DualNICPortal::setupAsyncRoutes(){
   _server.on("/", HTTP_GET, [this](AsyncWebServerRequest* req){
-    req->send_P(200, "text/html", INDEX_HTML);
+    req->send(200, "text/html", INDEX_HTML);
   });
 
   _server.on("/api/status", HTTP_GET, [this](AsyncWebServerRequest* req){
@@ -544,7 +588,6 @@ void DualNICPortal::setupAsyncRoutes(){
   _server.on("/api/wifi/disconnect", HTTP_POST, [](AsyncWebServerRequest* req){}, NULL, handlePost);
   _server.on("/api/eth/set", HTTP_POST, [](AsyncWebServerRequest* req){}, NULL, handlePost);
   _server.on("/api/mqtt/set", HTTP_POST, [](AsyncWebServerRequest* req){}, NULL, handlePost);
-  _server.on("/api/mqtt/test", HTTP_POST, [](AsyncWebServerRequest* req){}, NULL, handlePost);
   _server.on("/api/ap/enable", HTTP_POST, [](AsyncWebServerRequest* req){}, NULL, handlePost);
   _server.on("/api/ap/disable", HTTP_POST, [](AsyncWebServerRequest* req){}, NULL, handlePost);
   _server.on("/api/reset", HTTP_POST, [](AsyncWebServerRequest* req){}, NULL, handlePost);
@@ -593,6 +636,12 @@ String DualNICPortal::jsonStatus(const String& ctx){
   doc["mqtt"]["host"] = _cfg.mqtt_host;
   doc["mqtt"]["port"] = _cfg.mqtt_port;
   doc["mqtt"]["topic"] = _cfg.mqtt_topic;
+  doc["mqtt"]["user"]        = _cfg.mqtt_user;
+  doc["mqtt"]["pass_set"]    = _cfg.mqtt_pass.length() > 0;
+  doc["mqtt"]["probe_running"]= s_mqttProbeRunning;
+  doc["mqtt"]["last_rc"]     = s_mqttLastRC;     // PubSubClient::state()
+  doc["mqtt"]["last_ok"]     = s_mqttLastOK;
+  
 
   doc["mdns"]["host"] = _mdnsHost;
   doc["ui"]["mode"] = ctx;
@@ -646,19 +695,28 @@ String DualNICPortal::apiHandler(const String& path, const String& method, const
   }
 
   if (path == "/api/mqtt/set" && method == "POST") {
-    JsonDocument d; if (deserializeJson(d, body)) { code=400; return jsonErr("JSON invalid"); }
-    _cfg.mqtt_host = d["host"].as<String>();
-    _cfg.mqtt_port = d["port"] | _cfg.mqtt_port;
-    _cfg.mqtt_user = d["user"].as<String>();
-    _cfg.mqtt_pass = d["pass"].as<String>();
-    _cfg.mqtt_topic= d["topic"].as<String>();
-    saveConfig(); return jsonOk("mqtt_saved");
-  }
+    JsonDocument d;
+    if (deserializeJson(d, body)) { code=400; return jsonErr("JSON invalid"); }
 
-  if (path == "/api/mqtt/test" && method == "POST") {
-    bool ok = mqttTestConnectivity(30000);
-    if (!ok) { code=504; return jsonErr("MQTT gagal/timeout"); }
-    return jsonOk("mqtt_ok");
+    _cfg.mqtt_host  = d["host"].as<String>();
+    _cfg.mqtt_port  = d["port"] | _cfg.mqtt_port;
+    _cfg.mqtt_user  = d["user"].as<String>();
+    // hanya overwrite jika field 'pass' dikirim
+    if (!d["pass"].isNull()) {
+      String p = d["pass"].as<String>();
+      if (p.length()) _cfg.mqtt_pass = p; // atau langsung = p; jika ingin bisa clear
+    }
+    _cfg.mqtt_topic = d["topic"].as<String>();
+    saveConfig();
+
+    // Jangan tes koneksi di thread async_tcp (hindari WDT). Jadwalkan saja.
+    s_mqttProbeRequested = true;
+
+    JsonDocument resp;
+    resp["status"]  = "mqtt_saved";
+    resp["testing"] = true;
+    String s; serializeJson(resp, s);
+    return s;
   }
 
   if (path == "/api/reset" && method == "POST") {
@@ -688,14 +746,22 @@ bool DualNICPortal::mqttTestConnectivity(uint32_t timeoutMs){
   else if (ethernetLinkUp())         _mqttTest.setClient(_ethClient);
   else return false;
 
-  _mqttTest.setServer(_cfg.mqtt_host.c_str(), _cfg.mqtt_port);
+  _mqttTest.setServer( _cfg.mqtt_host.c_str(), _cfg.mqtt_port);
+  Serial.print("Menghubungkan ke MQTT ");
+  Serial.print(_cfg.mqtt_host);
+  Serial.print(":");
+  Serial.println(_cfg.mqtt_port);
+  
   uint32_t t0 = millis();
-  while (!_mqttTest.connected() && (millis() - t0) < timeoutMs) {
-    if (_cfg.mqtt_user.length()) _mqttTest.connect("cfg_tester", _cfg.mqtt_user.c_str(), _cfg.mqtt_pass.c_str());
-    else _mqttTest.connect("cfg_tester");
-    if (!_mqttTest.connected()) delay(500);
+  bool ok;
+
+  while (!ok && (millis() - t0) < timeoutMs) {
+    if (_cfg.mqtt_user.length() > 0) ok = _mqttTest.connect("Barcode_Device", _cfg.mqtt_user.c_str(), _cfg.mqtt_pass.c_str());
+    else ok = _mqttTest.connect("Barcode_Device");
+
   }
-  bool ok = _mqttTest.connected();
-  if (ok) _mqttTest.disconnect();
+
+  if(ok) Serial.println("[MQTT] Connected");
+  else Serial.printf("[MQTT] Connection Failed, rc= %d", _mqttTest.state());
   return ok;
 }
