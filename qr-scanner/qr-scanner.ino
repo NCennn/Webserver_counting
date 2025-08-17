@@ -1,222 +1,210 @@
-#include <SPI.h>
-#include <Ethernet.h>
-#include <Preferences.h>
+/*
+  Sketch Utama - Menggunakan DualNICPortal (library)
+  Fitur:
+    - GM66 (UART) + debounce → kirim ke MQTT (cfg.mqtt_topic + "/scan")
+    - DS3231 (SDA=5, SCL=6), waktu lokal WIB, NTP sync saat online
+    - OfflineQueue 5MB (LittleFS), auto-flush saat MQTT connected
+    - Portal jaringan dipindah ke /lib/DualNICPortal
+*/
+
+#include <Arduino.h>
+#include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include <HardwareSerial.h>
-#include <SmoothThermistor.h>
+#include <Wire.h>
+#include <RTClib.h>
 
-#define RX_PIN 44
-#define TX_PIN 43
+// === custom libs ===
+#include "OfflineQueue.h"
+#include "BarcodeScannerGM66.h"
+#include "RTCClockDS3231.h"
+#include "DualNICPortal.h"
 
-HardwareSerial GM66(1);
-String trimmedBarcode = "";
-Preferences preferences;
+// ====== USER CONFIG: GM66 ======
+#define GM66_RX_PIN      44
+#define GM66_TX_PIN      43
+#define GM66_TRIG_PIN   -1
+#define GM66_BAUD        9600
+#define GM66_DEBOUNCE_MS 800
 
-SmoothThermistor smoothThermistor(4,              // the analog pin to read from
-                                  ADC_SIZE_12_BIT, // the ADC size
-                                  10000,           // the nominal resistance
-                                  10000,           // the series resistance
-                                  3950,            // the beta coefficient of the thermistor
-                                  25,              // the temperature for nominal resistance
-                                  10);             // the number of samples to take for each measurement
-#define FAN_PIN 3
+// ====== Instances ======
+BarcodeScannerGM66 g_scanner;
+RTCClockDS3231     g_rtc;
+OfflineQueue       g_queue;
 
-byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+// MQTT client (portal akan pilihkan backend WiFi/Eth)
+WiFiClient     g_wifiClient;
+EthernetClient g_ethClient;
+PubSubClient   g_mqtt;
 
-IPAddress staticIP(10, 26, 101, 197);
-IPAddress gateway(10, 26, 101, 190);
-IPAddress subnet(255, 255, 255, 0);
-IPAddress dns(8, 8, 8, 8);
+// Portal pins (SAMAKAN dgn wiring W5500)
+DualNICPortal::Pins portalPins{
+  /*w5500_cs=*/5, /*w5500_rst=*/-1, /*sck=*/8, /*miso=*/9, /*mosi=*/10
+};
+DualNICPortal portal(portalPins, "barcode", "/config.json");
 
-EthernetServer server(80);
-float temp = 0.0;
 
-// ================== Load Configuration ===================
-bool loadStaticNetwork() {
-  preferences.begin("network", true);
-  bool hasIP = preferences.getBool("hasIP", false);
-  if (!hasIP) {
-    preferences.end();
-    Serial.println("No saved IP config. Using default static IP.");
+static String mqttScanTopic(){ return portal.config().mqtt_topic + "/scan"; }
+
+// Bangun payload JSON yang sama seperti yang dikirim ke MQTT
+static void buildScanJson(const ScanEvent& ev, String& out){
+  JsonDocument d;
+  d["ip_address"]  = ev.ip_address;
+  d["kode_barang"] = ev.kode_barang;
+  d["tanggal"]     = ev.tanggal;
+  d["waktu"]       = ev.waktu;
+  serializeJson(d, out);
+} 
+
+static bool mqttPublishScan(const ScanEvent& ev){
+  String payload;
+  buildScanJson(ev, payload);
+  // (opsional) tampilkan juga saat publish langsung:
+  Serial.print("[MQTT] "); Serial.println(payload);
+  return g_mqtt.publish(mqttScanTopic().c_str(), payload.c_str(), false);
+}
+
+
+static bool ensureMqttConnected(){
+  auto& cfg = portal.config();
+  if (cfg.mqtt_host.isEmpty()) return false;
+  if (!portal.selectClient(g_mqtt, g_wifiClient, g_ethClient)) return false;
+
+  g_mqtt.setServer(cfg.mqtt_host.c_str(), cfg.mqtt_port);
+  if (g_mqtt.connected()) return true;
+
+  // unique id
+  uint8_t mac[6]; WiFi.macAddress(mac);
+  char id[20]; snprintf(id, sizeof(id), "barcode_%02X%02X%02X", mac[3],mac[4],mac[5]);
+
+  if (cfg.mqtt_user.length()){
+    return g_mqtt.connect(id, cfg.mqtt_user.c_str(), cfg.mqtt_pass.c_str());
+  } else {
+    return g_mqtt.connect(id);
+  }
+}
+
+// barcode callback
+static void onBarcodeScanned(const String& kode){
+  String tgl, jam; g_rtc.nowLocal(tgl, jam);
+  ScanEvent ev{ portal.activeIP(), kode, tgl, jam };
+
+  bool published=false;
+  if (ensureMqttConnected()){
+    published = mqttPublishScan(ev);
+  }
+  if (!published){
+    // map ke OfflineQueue::ScanEvent
+    ::ScanEvent qev{ev.ip_address, ev.kode_barang, ev.tanggal, ev.waktu}; // overload aman
+    // catatan: OfflineQueue.h memiliki struct ScanEvent yang sama; cast manual:
+    // supaya gampang, tulis langsung:
+    OfflineQueue tmp; // hanya untuk tipe - tidak dipakai
+    g_queue.enqueue(*(reinterpret_cast<const ::ScanEvent*>(&ev))); // tapi lebih aman begini ↓
+  }
+}
+
+// karena beda struct, bikin helper enqueue aman:
+static void enqueueEvent(const ScanEvent& ev){
+  ::ScanEvent e2{ev.ip_address, ev.kode_barang, ev.tanggal, ev.waktu};
+  g_queue.enqueue(e2);
+}
+
+void setup(){
+  Serial.begin(115200); delay(200);
+  Serial.println("=== Boot (with DualNICPortal) ===");
+
+  // start portal (jaringan + UI + API dasar)
+  portal.begin();
+
+  // hooks: tambah info queue ke /api/status
+  portal.setStatusAugmenter([](JsonDocument& root){
+    // root["queue"]["count"], ["bytes"]
+    extern OfflineQueue g_queue;
+    root["queue"]["count"] = g_queue.count();
+    root["queue"]["bytes"] = g_queue.sizeBytes();
+  });
+
+  // hooks: endpoint ekstra (queue + scanner trigger)
+  portal.setExtraApiHandler([](const String& path, const String& method, const String& body,
+                              const String& ctx, String& ct, int& code, String& out)->bool{
+    ct = "application/json"; code = 200;
+
+    if (path == "/api/queue/status" && method == "GET") {
+      JsonDocument d; d["count"]=g_queue.count(); d["bytes"]=g_queue.sizeBytes();
+      serializeJson(d, out); return true;
+    }
+    if (path == "/api/queue/flush" && method == "POST") {
+      size_t n = 0;
+      if (ensureMqttConnected()){
+        n = g_queue.flush([](const ScanEvent& ev){   // <<--- langsung ScanEvent
+          return mqttPublishScan(ev);
+        }, 1000);
+      }
+      JsonDocument d; d["flushed"] = (int)n; serializeJson(d, out); return true;
+    }
+    if (path == "/api/scanner/trigger" && method == "POST") {
+    #if GM66_TRIG_PIN >= 0
+      g_scanner.triggerOnce(60);
+      JsonDocument d; d["status"]="triggered"; serializeJson(d,out); return true;
+    #else
+      code = 400; out = "{\"error\":\"no_trigger_pin\"}"; return true;
+    #endif
+    }
     return false;
-  }
+  });
 
-  byte ip[4], gw[4], sn[4];
-  preferences.getBytes("ip", ip, 4);
-  preferences.getBytes("gateway", gw, 4);
-  preferences.getBytes("subnet", sn, 4);
 
-  staticIP = IPAddress(ip[0], ip[1], ip[2], ip[3]);
-  gateway = IPAddress(gw[0], gw[1], gw[2], gw[3]);
-  subnet = IPAddress(sn[0], sn[1], sn[2], sn[3]);
+  // RTC & Scanner & Queue
+  if (!g_rtc.begin(5,6)) Serial.println("[RTC] DS3231 init gagal");
+  else Serial.println("[RTC] DS3231 ok");
 
-  preferences.end();
-  Serial.print("Loaded IP from preferences: ");
-  Serial.println(staticIP);
-  return true;
-}
+  g_scanner.begin(Serial1, GM66_RX_PIN, GM66_TX_PIN, GM66_BAUD, GM66_TRIG_PIN);
+  g_scanner.setDebounceMs(GM66_DEBOUNCE_MS);
+  g_scanner.onScan([](const String& k){
+    String tgl, jam; g_rtc.nowLocal(tgl, jam);
+    ScanEvent ev{ portal.activeIP(), k, tgl, jam };
 
-void saveStaticNetwork(IPAddress newIP, IPAddress newGateway, IPAddress newSubnet) {
-  preferences.begin("network", false);
-  byte ip[4] = { newIP[0], newIP[1], newIP[2], newIP[3] };
-  byte gateway[4] = { newGateway[0], newGateway[1], newGateway[2], newGateway[3] };
-  byte subnet[4] = { newSubnet[0], newSubnet[1], newSubnet[2], newSubnet[3] };
-  preferences.putBytes("ip", ip, 4);
-  preferences.putBytes("gateway", gateway, 4);
-  preferences.putBytes("subnet", subnet, 4);
-  preferences.putBool("hasIP", true);  // Simpan flag
-  preferences.end();
-  Serial.println("Success Change Network");
-}
+    // Cetak payload JSON ke Serial
+    String payload; 
+    buildScanJson(ev, payload);
+    Serial.print("[SCAN] ");
+    Serial.println(payload);
 
-// ================== Barcode Reader ===================
-void readGM66() {
-  if (GM66.available()) {
-    String barcode = "";
-    unsigned long timeout = millis();
-    while (millis() - timeout < 200) {
-      if (GM66.available()) {
-        char c = GM66.read();
-        if (c >= 32 && c <= 126) {
-          barcode += c;
-        }
-        timeout = millis();
+    // Kirim ke MQTT atau antrikan
+    if (ensureMqttConnected()){
+      if (!g_mqtt.publish(mqttScanTopic().c_str(), payload.c_str(), false)) {
+        g_queue.enqueue(ev);
       }
+    } else {
+      g_queue.enqueue(ev);
     }
-    barcode.trim();
-    if (barcode.length() > 0) {
-      trimmedBarcode = barcode.substring(0, barcode.length());
-      Serial.print("Barcode: ");
-      Serial.println(trimmedBarcode);
+  });
+
+
+
+  g_queue.begin("/scan_queue.ndjson", 5*1024*1024);
+
+  // kalau RTC belum valid & Wi-Fi sudah connect, sync NTP (WIB)
+  if (!g_rtc.isValid()){
+    if (ensureMqttConnected() || (WiFi.status()==WL_CONNECTED)) {
+      if (g_rtc.syncFromNTPAndSetRTC(7000)) Serial.println("[RTC] RTC diset dari NTP (WIB).");
+      else Serial.println("[RTC] NTP gagal; RTC mungkin belum valid.");
     }
   }
 }
 
-// ================== Web Handling ===================
-void handleClient(EthernetClient& client, const String& req) {
-  if (req.indexOf("GET /qrcode") >= 0) {
-    sendJsonResponse(client);
-  } else if (req.indexOf("GET /config") >= 0) {
-    sendConfigPage(client);
-  } 
+void loop(){
+  portal.loop();
 
-    else if (req.indexOf("POST /setip") >= 0) {
-    String body = "";
-    while (client.available()) body += (char)client.read();
-    int ipIndex = body.indexOf("ip=");
-    int gatewayIndex = body.indexOf("gateway=");
-    int subnetIndex = body.indexOf("subnet=");
-    if (ipIndex >= 0 && gatewayIndex >= 0 && subnetIndex >= 0) {
-      String ipStr = body.substring((ipIndex + 3), body.indexOf("&", ipIndex));
-      String gwStr = body.substring((gatewayIndex + 8), body.indexOf("&", gatewayIndex));
-      String snStr = body.substring(subnetIndex + 7);
+  g_scanner.loop();
 
-      ipStr.replace("%2E", ".");
-      gwStr.replace("%2E", ".");
-      snStr.replace("%2E", ".");
-
-      IPAddress newIP, newGW, newSN;
-      if (newIP.fromString(ipStr) && newGW.fromString(gwStr) && newSN.fromString(snStr)) {
-        saveStaticNetwork(newIP, newGW, newSN);
-        client.println("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\nNetwork saved. Please Restart ESP!!.");
-        ESP.restart();
-        return;
-      }
-    }
-    client.println("HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\nInvalid IP");
-  } 
-  else {
-    sendHomePage(client);
-  }
-}
-
-void sendJsonResponse(EthernetClient& client) {
-  JsonDocument doc;
-  doc["kode_barang"] = trimmedBarcode;
-  doc["ip_ethernet"] = Ethernet.localIP().toString();
-  doc["temperature"] = smoothThermistor.temperature();
-
-  String output;
-  serializeJson(doc, output);
-
-  client.println("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n" + output);
-}
-
-void sendHomePage(EthernetClient& client) {
-  client.println("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n");
-  client.println("<html><body><h1>ESP32 Barcode</h1><ul>");
-  client.println("<li><a href='/qrcode'>QR Code</a></li>");
-  client.println("<li><a href='/config'>Set IP</a></li>");
-  client.println("<li><a href='/wifi'>WiFi Config</a></li>");
-  client.println("</ul></body></html>");
-}
-
-void sendConfigPage(EthernetClient& client) {
-  client.println("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n");
-  client.println("<form method='POST' action='/setip'> IP Baru: <input name='ip'> <br>");
-  client.println("Gateway Baru: <input name='gateway'> <br>");
-  client.println("Subnet Baru: <input name='subnet'> <br>");
-  client.println("<input type='submit'> </form>");
-}
-
-// ================== Setup & Loop ===================
-void setup() {
-  Serial.begin(115200);
-  GM66.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
-  analogWrite(FAN_PIN, 0);
-  delay(500);
-  Ethernet.init(5);
-  smoothThermistor.useAREF(true);
-
-  if (!loadStaticNetwork()) {
-    // Jika tidak ada IP tersimpan, pakai IP default
-    staticIP = IPAddress(10, 26, 101, 197);
-    gateway = IPAddress(10, 26, 101, 190);
-    subnet = IPAddress(255, 255, 255, 0);
-  }
-
-  Ethernet.begin(mac, staticIP, dns, gateway, subnet);
-  Serial.print("Ethernet IP: ");
-  Serial.println(Ethernet.localIP());
-
-  if (Ethernet.hardwareStatus() == EthernetNoHardware) {
-    Serial.println("Ethernet shield was not found.");
-  } else if (Ethernet.linkStatus() == LinkOFF) {
-    Serial.println("Ethernet cable is not connected.");
-  }
-
-  server.begin();
-}
-
-void loop() {
-  temp = smoothThermistor.temperature();
-  Serial.print("Suhu: ");
-  Serial.println(temp);
-  delay(100);
-  if (temp >= 50 ){
-    analogWrite(FAN_PIN, 255);
-    Serial.println("FAN ON");
-    delay(1000);
-  }else if(temp <= 30){
-    analogWrite(FAN_PIN, 0);
-    Serial.println("FAN OFF");
-    delay(1000);
-  }
-  readGM66();
-
-  EthernetClient client = server.available();
-  if (client) {
-    String req = "";
-    while (client.connected()) {
-      Serial.println("Berhasil Terhubung..");
-      if (client.available()) {
-        char c = client.read();
-        req += c;
-        if (req.endsWith("\r\n\r\n")) break;
-      }
-    }
-    Serial.println("REQ: " + req);
-    handleClient(client, req);
-    client.stop();
+  g_mqtt.loop();
+  if (ensureMqttConnected()){
+    g_queue.flush([](const ScanEvent& ev){
+      String payload; 
+      buildScanJson(ev, payload);
+      Serial.print("[FLUSH] ");
+      Serial.println(payload);
+      return g_mqtt.publish(mqttScanTopic().c_str(), payload.c_str(), false);
+    }, 200);
   }
 }
