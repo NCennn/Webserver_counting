@@ -31,16 +31,20 @@
 
 // ====================== KONFIGURASI PIN ======================
 // SESUAIKAN dengan wiring Anda! Nilai di bawah hanyalah contoh.
-static constexpr int PIN_GM66_RX   = 1;   // RX dari ESP32S3 (terhubung ke TX GM66)
-static constexpr int PIN_GM66_TX   = 2;   // TX dari ESP32S3 (terhubung ke RX GM66)
+static constexpr int PIN_GM66_RX   = 44;   // RX dari ESP32S3 (terhubung ke TX GM66)
+static constexpr int PIN_GM66_TX   = 43;   // TX dari ESP32S3 (terhubung ke RX GM66)
 static constexpr int PIN_GM66_TRIG = -1;  // set ke pin digital jika modul GM66 memakai pin trigger (aktif LOW)
+static const size_t QUEUE_MAX_BYTES = 512 * 1024;
 
 // SPI untuk W5500 — sesuaikan dengan papan Anda
-static constexpr int PIN_W5500_CS   = 9;
+static constexpr int PIN_W5500_CS   = 4;
 static constexpr int PIN_W5500_RST  = 8;
 static constexpr int PIN_SPI_SCK    = 12;
 static constexpr int PIN_SPI_MISO   = 13;
 static constexpr int PIN_SPI_MOSI   = 11;
+
+static const int I2C_SDA = 5;
+static const int I2C_SCL = 6;
 
 // mDNS hostname
 static const char* MDNS_HOST = "barcode";
@@ -57,16 +61,12 @@ BarcodeScannerGM66 scanner;
 OfflineQueue   queue;
 RTCClockDS3231 rtc;
 
-// ====================== UTIL ================================
-static String payloadFor(const ScanEvent& e) {
-  // Bangun JSON tanpa alokasi besar
-  JsonDocument d;
-  d["ip_address"]  = e.ip_address;
-  d["kode_barang"] = e.kode_barang;
-  d["tanggal"]     = e.tanggal;
-  d["waktu"]       = e.waktu;
-  String out; serializeJson(d, out);
-  return out;
+String activeIP(){
+  if (WiFi.status() == WL_CONNECTED) return WiFi.localIP().toString();
+#ifdef ETHERNET_H
+  if (Ethernet.linkStatus() == LinkON) return Ethernet.localIP().toString();
+#endif
+  return String("0.0.0.0");
 }
 
 static bool ensureMqttConnected() {
@@ -78,6 +78,11 @@ static bool ensureMqttConnected() {
   if (cfg.mqtt_host.isEmpty() || cfg.mqtt_port == 0) return false;
   mqtt.setServer(cfg.mqtt_host.c_str(), cfg.mqtt_port);
 
+  Serial.print("Menghubungkan ke MQTT ");
+  Serial.print(cfg.mqtt_host);
+  Serial.print(":");
+  Serial.println(cfg.mqtt_port);
+
   if (mqtt.connected()) return true;
 
   // Client ID unik
@@ -85,24 +90,24 @@ static bool ensureMqttConnected() {
   bool ok;
   if (cfg.mqtt_user.length()) ok = mqtt.connect(cid.c_str(), cfg.mqtt_user.c_str(), cfg.mqtt_pass.c_str());
   else                        ok = mqtt.connect(cid.c_str());
+
+  if(ok) Serial.println("[MQTT] Connected");
+  else Serial.printf("[MQTT] Connection Failed, rc= %d", mqtt.state());
+
   return ok;
 }
 
-static bool publishEvent(const ScanEvent& e) {
-  if (!ensureMqttConnected()) return false;
-  const AppConfig& cfg = portal.config();
-  if (cfg.mqtt_topic.isEmpty()) return false;
 
-  String js = payloadFor(e);
-  // PubSubClient max payload default 256B; naikkan via setBufferSize jika diperlukan
-  #ifndef MQTT_MAX_PACKET_SIZE
-  #define MQTT_MAX_PACKET_SIZE 256
-  #endif
-  if (js.length() > MQTT_MAX_PACKET_SIZE - 16) {
-    // Buffer default 256; jika lebih besar, coba setBufferSize
-    mqtt.setBufferSize(js.length() + 32);
-  }
-  return mqtt.publish(cfg.mqtt_topic.c_str(), js.c_str());
+bool publishEvent(const ScanEvent& e){
+  const AppConfig& cfg = portal.config();
+  JsonDocument d;
+  d["ip_address"]  = e.ip_address;
+  d["kode_barang"] = e.kode_barang;
+  d["tanggal"]     = e.tanggal;
+  d["waktu"]       = e.waktu;
+  String buf; 
+  serializeJson(d, buf);
+  return mqtt.publish(cfg.mqtt_topic.c_str(), buf.c_str(), true);
 }
 
 static size_t flushQueueLimited(size_t maxItems = 200) {
@@ -111,44 +116,6 @@ static size_t flushQueueLimited(size_t maxItems = 200) {
   }, maxItems);
 }
 
-static ScanEvent makeEventFromCode(const String& code) {
-  ScanEvent e;
-  e.ip_address = portal.activeIP();
-  e.kode_barang = code;
-
-  String tgl, wkt;
-  if (rtc.isValid()) {
-    rtc.nowLocal(tgl, wkt);
-  } else {
-    // Fallback: gunakan strftime agar panjang string aman untuk buffer
-    struct tm ti;
-    if (getLocalTime(&ti, 500)) {
-      char b1[11]; // YYYY-MM-DD (10) + NUL
-      char b2[9];  // HH:MM:SS (8)  + NUL
-      size_t n1 = strftime(b1, sizeof(b1), "%Y-%m-%d", &ti);
-      size_t n2 = strftime(b2, sizeof(b2), "%H:%M:%S", &ti);
-      tgl = n1 ? b1 : "1970-01-01";
-      wkt = n2 ? b2 : "00:00:00";
-    } else {
-      tgl = "1970-01-01";
-      wkt = "00:00:00";
-    }
-  }
-  e.tanggal = tgl;
-  e.waktu   = wkt;
-  return e;
-}
-
-// =================== CALLBACK SCAN ===========================
-static void onScanCb(const String& kode) {
-  ScanEvent e = makeEventFromCode(kode);
-  if (publishEvent(e)) {
-    Serial.printf("[MQTT] Publish OK: %s\n", kode.c_str());
-  } else {
-    bool ok = queue.enqueue(e);
-    Serial.printf("[QUEUE] Enqueue %s (%s)\n", ok?"OK":"FAILED", kode.c_str());
-  }
-}
 
 // =================== SETUP / LOOP ============================
 void setup() {
@@ -156,9 +123,7 @@ void setup() {
   delay(500);
   Serial.println("\n[BOOT] Barcode & Counter — QR Scanner");
 
-  // FS & antrian
-  LittleFS.begin(true);
-  queue.begin(QUEUE_FILE, 5*1024*1024);
+  queue.begin(QUEUE_FILE, QUEUE_MAX_BYTES);
 
   // Portal jaringan (Wi-Fi/Ethernet + UI)
   portal.setStatusAugmenter([](JsonDocument& root){
@@ -178,19 +143,28 @@ void setup() {
 
   portal.begin();
 
-  // RTC DS3231
-  rtc.begin(); // gunakan default pin I2C dari board; ubah di RTCClockDS3231.h jika perlu
-  if (!rtc.isValid()) {
-    // Coba sync NTP jika ada internet (agar DS3231 terset untuk ke depannya)
-    rtc.syncFromNTPAndSetRTC(7000);
-  }
+  // RTC
+  if (!rtc.begin(I2C_SDA, I2C_SCL)) Serial.println("RTC init failed");
+  if (!rtc.isValid()) Serial.println("RTC not valid – set via NTP when Wi‑Fi up");
 
   // Scanner GM66 di Serial1 (ubah pin sesuai atas)
   scanner.begin(Serial1, PIN_GM66_RX, PIN_GM66_TX, 9600, PIN_GM66_TRIG);
-  scanner.setDebounceMs(800);
-  scanner.onScan(onScanCb);
+  scanner.setDebounceMs(600);
+  scanner.onScan([&](const String& kode){
+    String tgl, jam; rtc.nowLocal(tgl, jam);
+    ScanEvent ev{ activeIP(), kode, tgl, jam };
+    bool sent = false;
+    if (ensureMqttConnected()) sent = publishEvent(ev);
+    if (!sent) {
+      queue.enqueue(ev);
+      Serial.printf("[QUEUE] Enqueued: %s\n", kode.c_str());
+    } else {
+      Serial.printf("[MQTT] Sent: %s\n", kode.c_str());
+    }
+  });
 
   // MQTT client basic callbacks (opsional)
+  ensureMqttConnected();
   mqtt.setCallback([](char*, uint8_t*, unsigned int){});
 
   Serial.printf("[INFO] Web UI: http://%s.local/\n", MDNS_HOST);
@@ -207,10 +181,10 @@ void loop() {
   scanner.loop();
 
   // Jaga koneksi MQTT & lakukan flush periodik
-  if (millis() - lastMqttAttempt > 1000) {
-    lastMqttAttempt = millis();
-    ensureMqttConnected();
-  }
+  // if (millis() - lastMqttAttempt > 1000) {
+  //   lastMqttAttempt = millis();
+  //   ensureMqttConnected();
+  // }
   if (mqtt.connected()) mqtt.loop();
 
   // Coba flush antrian tiap 2 detik saat online

@@ -15,36 +15,34 @@ size_t OfflineQueue::sizeBytes() const {
 }
 
 size_t OfflineQueue::count() const {
-  if (!LittleFS.exists(_path)) return 0;
-  File f = LittleFS.open(_path, "r"); if (!f) return 0;
-  size_t c=0; while (f.findUntil("\n", "\0")) c++; f.close(); return c;
+  File f = LittleFS.open(_path, "r"); if (!f) return 0; size_t n=0;
+  while (f.available()) { if (f.read()=='\n') n++; }
+  f.close(); return n;
 }
 
 bool OfflineQueue::writeLine(const String& line){
   File f = LittleFS.open(_path, "a"); if (!f) return false;
-  bool ok = (f.print(line) && f.print("\n")); f.close(); return ok;
+  bool ok = (f.print(line) && f.print('\n'));
+  f.close(); return ok;
 }
 
 bool OfflineQueue::pruneIfOversize(){
   size_t sz = sizeBytes();
   if (sz <= _maxBytes) return true;
-
-  // buang ~25% teratas (baris tertua)
-  File in = LittleFS.open(_path, "r"); if (!in) return false;
-  File tmp = LittleFS.open(String(_path)+".tmp", "w"); if (!tmp) { in.close(); return false; }
-
-  size_t target = sz - (_maxBytes*3/4); // jumlah byte yang ingin kita hapus
-  size_t dropped=0;
-  while (in.available() && dropped < target) {
-    String line = in.readStringUntil('\n');
-    dropped += line.length()+1;
+  // buang 20% terdepan
+  size_t target = (size_t)(sz * 0.8f);
+  File src = LittleFS.open(_path, "r"); if (!src) return false;
+  File tmp = LittleFS.open(String(_path)+".tmp", "w"); if (!tmp){ src.close(); return false; }
+  // skip awal sampai ukuran ~target
+  size_t skipped=0; String line;
+  while (src.available() && skipped < (sz - target)){
+    line = src.readStringUntil('\n'); skipped += line.length()+1;
   }
   // copy sisanya
-  while (in.available()) {
-    String line = in.readStringUntil('\n');
-    tmp.print(line); tmp.print("\n");
+  while (src.available()){
+    line = src.readStringUntil('\n'); tmp.print(line); tmp.print('\n');
   }
-  in.close(); tmp.close();
+  src.close(); tmp.close();
   LittleFS.remove(_path);
   LittleFS.rename(String(_path)+".tmp", _path);
   return true;
@@ -52,36 +50,46 @@ bool OfflineQueue::pruneIfOversize(){
 
 bool OfflineQueue::enqueue(const ScanEvent& e){
   JsonDocument d;
-  d["ip_address"]=e.ip_address; d["kode_barang"]=e.kode_barang;
-  d["tanggal"]=e.tanggal; d["waktu"]=e.waktu;
+  d["ip_address"]  = e.ip_address;
+  d["kode_barang"] = e.kode_barang;
+  d["tanggal"]     = e.tanggal;
+  d["waktu"]       = e.waktu;
   String line; serializeJson(d, line);
   if (!writeLine(line)) return false;
-  return pruneIfOversize();
+  pruneIfOversize();
+  return true;
 }
 
 size_t OfflineQueue::flush(std::function<bool(const ScanEvent&)> publishOne, size_t maxPerCall){
-  File in = LittleFS.open(_path, "r"); if (!in) return 0;
-  File out = LittleFS.open(String(_path)+".tmp", "w"); if (!out) { in.close(); return 0; }
+  File src = LittleFS.open(_path, "r"); if (!src) return 0;
+  File tmp = LittleFS.open(String(_path)+".tmp", "w"); if (!tmp){ src.close(); return 0; }
 
-  size_t sent=0;
-  while (in.available()) {
-    String line = in.readStringUntil('\n'); line.trim();
-    if (line.isEmpty()) continue;
+  size_t flushed=0; String line;
+  while (src.available()){
+    line = src.readStringUntil('\n'); line.trim(); if (!line.length()) continue;
 
-    // parse
-    JsonDocument d; DeserializationError e = deserializeJson(d, line);
-    if (!e) {
-      ScanEvent ev{ d["ip_address"].as<String>(), d["kode_barang"].as<String>(),
-                    d["tanggal"].as<String>(), d["waktu"].as<String>() };
-      bool ok=false;
-      if (sent < maxPerCall) ok = publishOne(ev);
-      if (ok) { sent++; continue; } // sukses → tidak ditulis ulang
+    // parse JSON line
+    JsonDocument d; DeserializationError err = deserializeJson(d, line);
+    bool ok = false;
+    if (!err){
+      ScanEvent e { (const char*)d["ip_address"], (const char*)d["kode_barang"], (const char*)d["tanggal"], (const char*)d["waktu"] };
+      ok = publishOne(e);
     }
-    // gagal parse / publish → tulis balik
-    out.print(line); out.print("\n");
+
+    if (ok) {
+      flushed++;
+      if (flushed >= maxPerCall) {
+        // salin sisa baris apa adanya
+        while (src.available()) { String rest = src.readStringUntil('\n'); tmp.print(rest); tmp.print('\n'); }
+        break;
+      }
+    } else {
+      // tulis kembali yang gagal
+      tmp.print(line); tmp.print('\n');
+    }
   }
-  in.close(); out.close();
+  src.close(); tmp.close();
   LittleFS.remove(_path);
   LittleFS.rename(String(_path)+".tmp", _path);
-  return sent;
+  return flushed;
 }

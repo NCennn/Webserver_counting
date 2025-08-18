@@ -1,14 +1,18 @@
 #pragma once
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <functional>
 
 struct ScanEvent {
-  String ip_address, kode_barang, tanggal, waktu;
+  String ip_address;
+  String kode_barang;
+  String tanggal; // YYYY-MM-DD
+  String waktu;   // HH:mm:ss
 };
 
 class OfflineQueue {
 public:
-  bool begin(const char* path="/scan_queue.ndjson", size_t maxBytes=5*1024*1024);
+  bool begin(const char* path="/scan_queue.ndjson", size_t maxBytes=1024*1024);
   bool enqueue(const ScanEvent& e);
   // publishOne harus return true jika MQTT publish sukses
   size_t flush(std::function<bool(const ScanEvent&)> publishOne, size_t maxPerCall=200);
