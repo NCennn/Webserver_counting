@@ -23,6 +23,7 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <time.h>
+#include <SmoothThermistor.h>
 
 #include "DualNICPortal.h"
 #include "BarcodeScannerGM66.h"
@@ -37,23 +38,40 @@ static constexpr int PIN_GM66_TRIG = -1;  // set ke pin digital jika modul GM66 
 static const size_t QUEUE_MAX_BYTES = 512 * 1024;
 
 // SPI untuk W5500 — sesuaikan dengan papan Anda
-static constexpr int PIN_W5500_CS   = 4;
-static constexpr int PIN_W5500_RST  = 8;
-static constexpr int PIN_SPI_SCK    = 12;
-static constexpr int PIN_SPI_MISO   = 13;
-static constexpr int PIN_SPI_MOSI   = 11;
+#define W5500_CS     4
+#define W5500_RST   -1        // tidak digunakan
+// #define W5500_SCK    7
+// #define W5500_MISO   8
+// #define W5500_MOSI   9
 
-static const int I2C_SDA = 5;
-static const int I2C_SCL = 6;
+#define I2C_SDA 5
+#define I2C_SCL 6
+
+#define TEMP_PIN 1
+#define FAN_PIN 2
+#define LED_PIN 3
 
 // mDNS hostname
 static const char* MDNS_HOST = "barcode";
-
+  
 // Path file antrian offline
 static const char* QUEUE_FILE = "/scan_queue.ndjson";
 
+uint32_t lastLEDBlink = 0;
+float temp;
+bool ledBlinkState = false;
+
+SmoothThermistor smoothThermistor(TEMP_PIN,              // the analog pin to read from
+                                  ADC_SIZE_12_BIT, // the ADC size
+                                  10000,           // the nominal resistance
+                                  10000,           // the series resistance
+                                  3950,            // the beta coefficient of the thermistor
+                                  25,              // the temperature for nominal resistance
+                                  10);             // the number of samples to take for each measurement
+
+
 // ====================== OBJEK GLOBAL =========================
-DualNICPortal portal({PIN_W5500_CS, PIN_W5500_RST, PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI}, MDNS_HOST);
+DualNICPortal portal({W5500_CS, W5500_RST}, MDNS_HOST);
 WiFiClient     wifiClient;
 EthernetClient ethClient;
 PubSubClient   mqtt;
@@ -63,10 +81,8 @@ RTCClockDS3231 rtc;
 
 String activeIP(){
   if (WiFi.status() == WL_CONNECTED) return WiFi.localIP().toString();
-#ifdef ETHERNET_H
-  if (Ethernet.linkStatus() == LinkON) return Ethernet.localIP().toString();
-#endif
-  return String("0.0.0.0");
+  else if (Ethernet.linkStatus() == LinkON) return Ethernet.localIP().toString();
+  else return String("0.0.0.0");
 }
 
 static bool ensureMqttConnected() {
@@ -120,6 +136,10 @@ static size_t flushQueueLimited(size_t maxItems = 200) {
 // =================== SETUP / LOOP ============================
 void setup() {
   Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(FAN_PIN, INPUT);
+  digitalWrite(LED_PIN, LOW);
+  smoothThermistor.useAREF(true);
   delay(500);
   Serial.println("\n[BOOT] Barcode & Counter — QR Scanner");
 
@@ -153,7 +173,7 @@ void setup() {
   scanner.onScan([&](const String& kode){
     String tgl, jam; rtc.nowLocal(tgl, jam);
     ScanEvent ev{ activeIP(), kode, tgl, jam };
-    bool sent = false;
+    bool sent = false;  
     if (ensureMqttConnected()) sent = publishEvent(ev);
     if (!sent) {
       queue.enqueue(ev);
@@ -175,18 +195,35 @@ uint32_t lastMqttAttempt = 0;
 uint32_t lastFlushCheck  = 0;
 
 void loop() {
+  temp = smoothThermistor.temperature();
+  // Serial.print("Suhu: ");
+  // Serial.println(temp);
+  delay(100);
+  if (temp >= 50 ){
+    analogWrite(FAN_PIN, 255);
+    // Serial.println("FAN ON");
+    delay(1000);
+  }else if(temp <= 30){
+    analogWrite(FAN_PIN, 0);
+    // Serial.println("FAN OFF");
+    delay(1000);
+  }
   portal.loop();     // wajib dipanggil
 
   // Jalankan loop scanner
   scanner.loop();
+  activeIP();
 
-  // Jaga koneksi MQTT & lakukan flush periodik
-  // if (millis() - lastMqttAttempt > 1000) {
-  //   lastMqttAttempt = millis();
-  //   ensureMqttConnected();
-  // }
-  if (mqtt.connected()) mqtt.loop();
-
+  if (!mqtt.loop()) {
+    if (millis() - lastLEDBlink >= 1000) {
+      lastLEDBlink = millis();
+      ledBlinkState = !ledBlinkState;
+      digitalWrite(LED_PIN, ledBlinkState ? HIGH : LOW);
+    }
+  } else if(mqtt.connected() || WiFi.status() == WL_CONNECTED){
+    digitalWrite(LED_PIN, HIGH);
+    // mqtt.loop(); // tetap jalankan loop MQTT saat connected
+  }
   // Coba flush antrian tiap 2 detik saat online
   if (mqtt.connected() && (millis() - lastFlushCheck > 2000)) {
     lastFlushCheck = millis();

@@ -566,8 +566,8 @@ bool DualNICPortal::ethernetBeginStatic(){
   // --- Ambil dari _cfg lebih dulu ---
   IPAddress ip, gw , sn;
   if (_cfg.eth_ip.isEmpty())      _cfg.eth_ip      = "10.26.101.197";
-  if (_cfg.eth_subnet.isEmpty())  _cfg.eth_subnet  = "10.26.101.1";
-  if (_cfg.eth_gateway.isEmpty()) _cfg.eth_gateway = "255.255.255.0";
+  if (_cfg.eth_gateway.isEmpty()) _cfg.eth_gateway = "10.26.101.1";
+  if (_cfg.eth_subnet.isEmpty())  _cfg.eth_subnet  = "255.255.255.0";
 
   Serial.printf("[ETH] cfg: ip='%s' gw='%s' sn='%s'\n",
                 _cfg.eth_ip.c_str(), _cfg.eth_gateway.c_str(), _cfg.eth_subnet.c_str());
