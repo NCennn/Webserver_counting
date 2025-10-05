@@ -49,7 +49,7 @@ extern const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
       <div class="pill muted" id="apTimer">AP Auto-Off: —</div>
       <div class="pill" id="queueStat">Queue: —</div>
     </div>
-    <div class="hint">Akses cepat: <b>http://barcode.local/</b> (mDNS). Wi-Fi diprioritaskan untuk koneksi keluar (contoh: MQTT). Halaman ini dapat diakses via Wi-Fi & Ethernet.</div>
+    <div class="hint">Akses cepat: <b>http://Counter.local/</b> (mDNS). Wi-Fi diprioritaskan untuk koneksi keluar (contoh: MQTT). Halaman ini dapat diakses via Wi-Fi & Ethernet.</div>
   </section>
 
   <section class="card" id="wifiCard">
@@ -396,7 +396,7 @@ bool DualNICPortal::saveConfig(){
 
 void DualNICPortal::setupAPIfNoCred(){
   if (_cfg.wifi_ssid.length() == 0) {
-    _apSSID = "Device-Barcode";
+    _apSSID = "Device-Counter";
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(_apSSID.c_str(), "12345678");
     Serial.printf("[AP] SoftAP '%s' started, IP: %s\n", _apSSID.c_str(), WiFi.softAPIP().toString().c_str());
@@ -451,7 +451,7 @@ void DualNICPortal::startMDNSIfNeeded(){
 }
 
 void DualNICPortal::apEnableForMinutes(uint32_t minutes){
-  _apSSID = "Device-Barcode";
+  _apSSID = "Device-Counter";
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(_apSSID.c_str(), "12345678");
   Serial.printf("[AP] SoftAP '%s' started, IP: %s", _apSSID.c_str(), WiFi.softAPIP().toString().c_str());
@@ -860,8 +860,8 @@ bool DualNICPortal::mqttTestConnectivity(uint32_t timeoutMs){
   bool ok = false;
 
   while (!ok && (millis() - t0) < timeoutMs) {
-    if (_cfg.mqtt_user.length() > 0) ok = _mqttTest.connect("Barcode_Device", _cfg.mqtt_user.c_str(), _cfg.mqtt_pass.c_str());
-    else ok = _mqttTest.connect("Barcode_Device");
+    if (_cfg.mqtt_user.length() > 0) ok = _mqttTest.connect("Counter_Device", _cfg.mqtt_user.c_str(), _cfg.mqtt_pass.c_str());
+    else ok = _mqttTest.connect("Counter_Device");
   }
 
   if(ok) Serial.println("[MQTT] Connected");

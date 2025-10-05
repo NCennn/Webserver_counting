@@ -31,7 +31,8 @@
 // ====================== KONFIGURASI PIN ======================
 // SESUAIKAN dengan wiring Anda! Nilai di bawah hanyalah contoh.
 #define SENSOR_PIN 2
-#define LED_PIN 1
+#define LED_PIN_STATUS 43
+#define LED_PIN_TRIG 1
 #define FAN_PIN 3
 
 static const size_t QUEUE_MAX_BYTES = 512 * 1024;
@@ -42,9 +43,6 @@ bool ledBlinkState = false;
 // SPI untuk W5500 — sesuaikan dengan papan Anda
 #define PIN_W5500_CS     4
 #define W5500_RST   -1
-// static constexpr int PIN_SPI_SCK    = 12;
-// static constexpr int PIN_SPI_MISO   = 13;
-// static constexpr int PIN_SPI_MOSI   = 11;
 
 float temp = 0;
 uint32_t itemCount = 0;
@@ -127,7 +125,8 @@ void setup() {
   delay(500);
   Serial.println("\n[BOOT] Counter is Ready");
   pinMode(SENSOR_PIN, INPUT_PULLUP);
-
+  pinMode(LED_PIN_TRIG, OUTPUT);
+  pinMode(LED_PIN_STATUS, OUTPUT);
   queue.begin(QUEUE_FILE, QUEUE_MAX_BYTES);
 
   // Portal jaringan (Wi-Fi/Ethernet + UI)
@@ -161,13 +160,13 @@ void setup() {
   Serial.println("[READY] Scan kode untuk menguji...");
 }
 
-uint32_t lastMqttAttempt = 0;
 uint32_t lastFlushCheck  = 0;
 
 void loop() {
   portal.loop();     // wajib dipanggil
   checkSensor();
   temp = rtc.getTemp();
+  Serial.println(temp);
 
   if (temp >= 50 ){
     analogWrite(FAN_PIN, 255);
@@ -183,10 +182,10 @@ void loop() {
     if (millis() - lastLEDBlink >= 1000) {
       lastLEDBlink = millis();
       ledBlinkState = !ledBlinkState;
-      digitalWrite(LED_PIN, ledBlinkState ? HIGH : LOW);
+      digitalWrite(LED_PIN_STATUS, ledBlinkState ? HIGH : LOW);
     }
   } else if(mqtt.connected() || WiFi.status() == WL_CONNECTED){
-    digitalWrite(LED_PIN, HIGH);
+    digitalWrite(LED_PIN_STATUS, HIGH);
     // mqtt.loop(); // tetap jalankan loop MQTT saat connected
   }
   // Coba flush antrian tiap 2 detik saat online
@@ -203,7 +202,7 @@ void loop() {
     int sensorState = digitalRead(SENSOR_PIN);
 
     // Serial.println(sensorState);
-    digitalWrite(LED_PIN, (sensorState == HIGH) ? HIGH : LOW);
+    digitalWrite(LED_PIN_TRIG, sensorState);
 
     
     if (lastSensorState == LOW && sensorState == HIGH) {

@@ -1,7 +1,8 @@
 #pragma once
 #include <Arduino.h>
 #include <WiFi.h>
-#include <ESPmDNS.h>
+// #include <ESPmDNS.h>
+#include <MDNS_Generic.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <SPI.h>
