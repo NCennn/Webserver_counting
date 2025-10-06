@@ -166,7 +166,7 @@ void loop() {
   portal.loop();     // wajib dipanggil
   checkSensor();
   temp = rtc.getTemp();
-  Serial.println(temp);
+  // Serial.println(temp);
 
   if (temp >= 50 ){
     analogWrite(FAN_PIN, 255);

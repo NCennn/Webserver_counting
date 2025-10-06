@@ -7,7 +7,7 @@ static volatile bool s_mqttProbeRunning   = false;
 static volatile bool s_mqttLastOK         = false;
 static volatile int  s_mqttLastRC         = 0;
 bool isEthernetConnected;
-#define LED_PIN 3
+#define LED_PIN 43
 
 
 // ================== HTML UI ==================
@@ -475,7 +475,10 @@ void DualNICPortal::wifiWatchdogLoop() {
 
   // --- Jika sudah tersambung Wi-Fi: bereskan state & housekeeping ---
   if (WiFi.status() == WL_CONNECTED) {
-    if (_wifiWatchActive) Serial.println(F("[WiFi] Reconnected; stop watchdog"));
+    if (_wifiWatchActive){
+      Serial.println(F("[WiFi] Reconnected; stop watchdog"));
+      mqttTestConnectivity(6000);
+    }
     _wifiWatchActive = false;
     _wifiWatchStart  = 0;
     _wifiScanAt      = 0;
@@ -492,7 +495,6 @@ void DualNICPortal::wifiWatchdogLoop() {
 
     // (Opsional) kalau punya fungsi untuk memilih jalur data, panggil di sini
     // selectClientPreferWiFi();
-    // mqttTestConnectivity(10000);
 
     return;
   }
